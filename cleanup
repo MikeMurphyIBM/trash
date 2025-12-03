@@ -320,6 +320,10 @@ ibmcloud pi instance operation "$LPAR_NAME" \
     --boot-mode a \
     --boot-operating-mode normal 
 
+# Action: Command to actually start the LPAR
+# The 'instance action' command performs the general 'start' operation on a PVM server instance [1].
+ibmcloud pi instance action "$LPAR_NAME" --operation start
+
 # --- Explicit Exit Check (Optional, but adds clear logging before the global trap) ---
 if [ $? -ne 0 ]; then
     echo "Error: Failed to start LPAR in NORMAL mode. Aborting."
