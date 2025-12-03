@@ -1,0 +1,353 @@
+#!/bin/bash
+
+# =======================================================================
+# SECTION 1: CRITICAL SAFETY, CONFIGURATION & VARIABLES
+# =======================================================================
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+echo "=== IBMi Snapshot Restore and Boot Script ==="
+
+# -------------------------
+# 1A. Environment Variables (User Defined)
+# -------------------------
+API_KEY="${IBMCLOUD_API_KEY}"       
+PVS_CRN="crn:v1:bluemix:public:power-iaas:dal10:a/21d74dd4fe814dfca20570bbb93cdbff:cc84ef2f-babc-439f-8594-571ecfcbe57a::" 
+CLOUD_INSTANCE_ID="cc84ef2f-babc-439f-8594-571ecfcbe57a" 
+LPAR_NAME="empty-ibmi-lpar"            
+REGION="us-south"
+STORAGE_TIER="tier3"
+CLONE_NAME_PREFIX="CLONE-RESTORE-$(date +"%Y%m%d%H%M")"
+
+# -------------------------
+# 1B. Dynamic Control Variables (Initialized for Cleanup Tracking)
+# -------------------------
+CLONE_BOOT_ID=""      # Tracks the ID of the dynamically created boot volume
+CLONE_DATA_IDS=""     # Tracks the comma-separated IDs of the dynamically created data volumes
+SOURCE_SNAPSHOT_ID="" # Tracks the ID of the discovered source snapshot
+SOURCE_VOLUME_IDS=""  # Tracks the comma-separated IDs of the volumes contained within the snapshot
+CLONE_TASK_ID=""      # Tracks the ID of the asynchronous cloning job
+JOB_SUCCESS=0         # 0 = Failure (Default), 1 = Success (Set at end of script)
+
+
+# =======================================================================
+# SECTION 2A: CLEANUP FUNCTION DEFINITION (The entire cleanup operation)
+# =======================================================================
+
+# This function is executed automatically upon any script error (ERR) or exit (EXIT).
+cleanup_on_failure() {
+    # If JOB_SUCCESS is 1, the script finished successfully, skip cleanup.
+    if [ $JOB_SUCCESS -eq 1 ]; then
+        echo "Script finished successfully. No cloned volume cleanup required."
+        return 0
+    fi
+
+    echo "================================================================"
+    echo "CRITICAL FAILURE DETECTED! Initiating volume rollback and deletion..."
+    echo "================================================================"
+
+    ALL_CLONE_IDS=""
+    
+    # 1. Prepare list of IDs for cleanup. This relies on the global variables set in Step 5.
+    if [ ! -z "$CLONE_BOOT_ID" ] || [ ! -z "$CLONE_DATA_IDS" ]; then
+        ALL_CLONE_IDS="$CLONE_BOOT_ID"
+        if [ ! -z "$CLONE_DATA_IDS" ]; then
+            # Concatenate IDs
+            ALL_CLONE_IDS=$(echo "$ALL_CLONE_IDS,$CLONE_DATA_IDS" | sed 's/,\+/,/g; s/^,//; s/,$//')
+        fi
+        
+        echo "Tracked Cloned Volumes for Deletion: $ALL_CLONE_IDS"
+
+        # 2. ATTEMPT DETACHMENT (Required if attachment succeeded in Step 6).
+        # We use the bulk-detach command, available since CLI v1.3.0 [1, 2].
+        echo "Attempting bulk detachment of volumes from LPAR '$LPAR_NAME'..."
+        ibmcloud pi instance volume bulk-detach "$LPAR_NAME" --volumes "$ALL_CLONE_IDS" 2>/dev/null && 
+        echo "Bulk detachment request accepted." || 
+        echo "Warning: Detachment attempt failed or volumes were not attached."
+        sleep 5 
+
+        # 3. ATTEMPT DELETION (Stops charges)
+        # We use the bulk-delete command, available since CLI v1.3.0 [1, 3].
+        echo "Attempting permanent bulk deletion of cloned volumes..."
+        ibmcloud pi volume bulk-delete --volumes "$ALL_CLONE_IDS" || { 
+            echo "FATAL ERROR: Failed to delete one or more cloned volumes. MANUAL CLEANUP REQUIRED for IDs: $ALL_CLONE_IDS"
+            exit 1
+        }
+        echo "Cloned volumes deleted successfully."
+    else
+        echo "No valid cloned Volume IDs found (failure occurred before cloning was tracked). No deletion required."
+    fi
+
+    echo "Cleanup phase complete. Terminating script execution."
+    exit 1
+}
+
+
+# =============================================================
+# SECTION 2B: Helper Function for Waiting for Asynchronous Clone Tasks
+# =============================================================
+function wait_for_job() {
+    CLONE_TASK_ID=$1
+    echo "Waiting for asynchronous clone task ID: $CLONE_TASK_ID to complete..."
+    
+    while true; do
+        # Use ibmcloud pi volume clone-async get to query clone task status [4].
+        TASK_STATUS=$(ibmcloud pi volume clone-async get $CLONE_TASK_ID --json | jq -r '.status')
+        
+        if [[ "$TASK_STATUS" == "completed" ]]; then
+            echo "Clone Task $CLONE_TASK_ID completed successfully."
+            break
+        elif [[ "$TASK_STATUS" == "failed" ]] || [[ "$TASK_STATUS" == "cancelled" ]]; then
+            echo "Error: Clone Task $CLONE_TASK_ID failed with status: $TASK_STATUS. Aborting script."
+            exit 1 # Triggers cleanup
+        else
+            echo "Clone task status: $TASK_STATUS. Waiting 30 seconds..."
+            sleep 30
+        fi
+    done
+}
+
+
+# =======================================================================
+# SECTION 3: TRAP ACTIVATION
+# =======================================================================
+
+# Activate the cleanup function upon any command failure (ERR) or script exit (EXIT)
+trap 'cleanup_on_failure' ERR EXIT
+
+
+# =======================================================================
+# SECTION 4: MAIN SCRIPT LOGIC (Execution)
+# =======================================================================
+
+# -------------------------
+# 2. Initialization and Targeting
+# -------------------------
+
+echo "--- Logging into IBM Cloud and Targeting PowerVS Workspace ---"
+
+ibmcloud login --apikey $API_KEY -r $REGION || { echo "ERROR: IBM Cloud login failed."; exit 1; }
+ibmcloud target -g Default || { echo "ERROR: Failed to target Default resource group."; exit 1; }
+ibmcloud pi ws target $PVS_CRN || { echo "ERROR: Failed to target PowerVS workspace $PVS_CRN."; exit 1; }
+echo "Successfully targeted workspace."
+
+# =============================================================
+# STEP 3: Dynamically Discover the Latest Snapshot ID
+# =============================================================
+
+echo "--- Step 3: Discovering the latest Snapshot ID in the Workspace ---"
+
+# List all snapshots in the entire workspace.
+SNAPSHOT_LIST_JSON=$(ibmcloud pi instance snapshot list --json)
+
+if [ $? -ne 0 ] || [ -z "$SNAPSHOT_LIST_JSON" ]; then
+    echo "Error: Failed to retrieve workspace snapshot list. Aborting."
+    exit 1 
+fi
+
+# Sort the snapshots by their creationDate, select the latest one, and extract its snapshotID.
+LATEST_SNAPSHOT_ID=$(echo "$SNAPSHOT_LIST_JSON" | \
+    jq -r '.snapshots | sort_by(.creationDate) | last .snapshotID')
+
+if [ -z "$LATEST_SNAPSHOT_ID" ] || [ "$LATEST_SNAPSHOT_ID" = "null" ]; then
+    echo "Error: Could not find any snapshots in the workspace. Aborting."
+    exit 1 
+fi
+
+SOURCE_SNAPSHOT_ID="$LATEST_SNAPSHOT_ID"
+
+echo "Latest Snapshot ID found: $SOURCE_SNAPSHOT_ID"
+
+
+# =============================================================
+# STEP 4: Discover Source Volume IDs from the Snapshot
+# =============================================================
+echo "--- Step 4: Discovering Source Volume IDs from Snapshot: $SOURCE_SNAPSHOT_ID ---"
+
+# Retrieve the snapshot metadata in JSON format.
+VOLUME_IDS_JSON=$(ibmcloud pi instance snapshot get $SOURCE_SNAPSHOT_ID --json)
+
+if [ $? -ne 0 ]; then
+    echo "Error retrieving snapshot details. Check snapshot ID/Name."
+    exit 1 
+fi
+
+# Extract the list of original Volume IDs (the keys within volumeSnapshots) and format them.
+SOURCE_VOLUME_IDS=$(echo "$VOLUME_IDS_JSON" | jq -r '.volumeSnapshots | keys | join(",")')
+
+if [ -z "$SOURCE_VOLUME_IDS" ]; then
+    echo "Error: No Volume IDs found in the snapshot metadata. Aborting."
+    exit 1 
+fi
+
+echo "Source Volume IDs found: $SOURCE_VOLUME_IDS"
+
+
+# =============================================================
+# STEP 5: Create Volume Clones and Discover New IDs
+# =============================================================
+
+echo "--- Step 5: Initiating volume cloning of all source volumes ---"
+
+# --- Clone Initiation ---
+set -x
+ibmcloud pi ws tg $PVS_CRN 
+
+# Use volume clone-async create for asynchronous cloning [5].
+CLONE_TASK_ID=$(ibmcloud pi volume clone-async create $CLONE_NAME_PREFIX \
+    --volumes "$SOURCE_VOLUME_IDS" \
+    --target-tier $STORAGE_TIER \
+    --json | jq -r '.cloneTaskID')
+    
+set +x
+
+if [ -z "$CLONE_TASK_ID" ]; then
+    echo "Error creating volume clone task. Aborting."
+    exit 1 
+fi
+
+echo "Clone task initiated. Task ID: $CLONE_TASK_ID."
+
+# -----------------------------------------------------------------------
+# Step 5 - Sub-step: Wait for asynchronous clone task completion
+# -----------------------------------------------------------------------
+wait_for_job $CLONE_TASK_ID
+
+# -----------------------------------------------------------------------
+# Step 5 - Sub-step: Discovery Retry Loop (Waiting for API Synchronization)
+# -----------------------------------------------------------------------
+
+echo "--- Discovery Retry Loop (Waiting for API Synchronization) ---"
+
+MAX_RETRIES=10
+RETRY_COUNT=0
+NEW_CLONE_IDS=""
+
+while [[ -z "$NEW_CLONE_IDS" ]] && [[ $RETRY_COUNT -lt $MAX_RETRIES ]]
+do
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo "Attempt $RETRY_COUNT of $MAX_RETRIES: Searching for volumes using prefix '$CLONE_NAME_PREFIX'..."
+    
+    # Search the full volume list and filter by the unique prefix, extracting the Volume IDs.
+    NEW_CLONE_IDS=$(ibmcloud pi volume list --long --json | \
+        jq -r ".volumes[] | select(.name | contains(\"$CLONE_NAME_PREFIX\")) | .volumeID")
+
+    if [[ -z "$NEW_CLONE_IDS" ]]
+    then
+        echo "Volumes not yet visible in the API inventory. Waiting 15 seconds..."
+        sleep 15
+    fi
+done
+
+# =============================================================
+# Step 5 - Sub-step: Final Check and ID Assignment
+# =============================================================
+
+if [[ -z "$NEW_CLONE_IDS" ]]; then
+    echo "CRITICAL ERROR: Failed to locate cloned volume IDs after waiting 150 seconds. API synchronization failed. Aborting."
+    exit 1 
+fi
+
+echo "Discovery successful! Located Volume IDs: $NEW_CLONE_IDS"
+
+# ASSUMPTION: The first ID found is the boot volume (Load Source).
+CLONE_BOOT_ID=$(echo "$NEW_CLONE_IDS" | head -n 1)
+
+# Collect remaining IDs as data volumes, comma-separated list.
+CLONE_DATA_IDS=$(echo "$NEW_CLONE_IDS" | tail -n +2 | tr '\n' ',' | sed 's/,$//')
+
+echo "New Boot Volume ID (assumed): $CLONE_BOOT_ID"
+echo "New Data Volume IDs: $CLONE_DATA_IDS"
+
+
+# =============================================================
+# STEP 6: Attaching cloned volumes to LPAR
+# =============================================================
+
+echo "--- Step 6: Attaching cloned volumes to $LPAR_NAME ---"
+
+# Action: Check LPAR existence and status [6].
+STATUS=$(ibmcloud pi instance get "$LPAR_NAME" --json 2>/dev/null | jq -r '.status')
+
+if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
+    echo "CRITICAL ERROR: Target LPAR '$LPAR_NAME' was NOT FOUND by the API. Cannot proceed with volume attachment."
+    exit 1
+fi
+
+# CRITICAL CHECK: The VSI must be shut down before volume attachment [7, 8].
+if [ "$STATUS" != "SHUTOFF" ]; then
+    echo "CRITICAL ERROR: LPAR '$LPAR_NAME' is not in SHUTOFF state ('$STATUS'). Cannot attach volumes."
+    exit 1 
+fi
+
+echo "LPAR '$LPAR_NAME' found with status: $STATUS. Proceeding with attachment."
+
+# Action: Attach the Load Source (Boot) volume using the --boot-volume flag [9, 10].
+ATTACH_CMD="ibmcloud pi instance volume attach $LPAR_NAME --boot-volume $CLONE_BOOT_ID"
+
+if [ ! -z "$CLONE_DATA_IDS" ]; then
+    # Action: Include additional data volumes if they exist.
+    ATTACH_CMD="$ATTACH_CMD --volumes $CLONE_DATA_IDS"
+fi
+
+echo "Executing attach command: $ATTACH_CMD"
+
+# Execute the volume attachment command. The attachment process requires the LPAR to be shut off [11-13].
+$ATTACH_CMD || {
+    echo "ERROR: Failed to attach volumes to LPAR. Check LPAR status and volume availability."
+    exit 1 # Triggers cleanup
+}
+
+echo "Volumes attached successfully. Waiting 60 seconds for attachment to finalize. Attachment is an asynchronous operation."
+sleep 60
+
+
+# =============================================================
+# STEP 7: Boot LPAR in Normal Server Operating Mode (Unattended IPL)
+# =============================================================
+echo "--- Step 7: Starting LPAR in Normal Server Operating Mode ---"
+
+# The 'instance operation' command is used to assign a server boot mode and operating mode [14, 15].
+ibmcloud pi instance operation "$LPAR_NAME" \
+    --operation-type boot \
+    --boot-mode a \
+    --boot-operating-mode normal || {
+        echo "Error: Failed to start LPAR in NORMAL mode."
+        exit 1
+    }
+
+echo "LPAR '$LPAR_NAME' start initiated successfully in NORMAL mode (Boot Mode A)."
+
+
+# =============================================================
+# STEP 8: Verify LPAR Status is Active
+# =============================================================
+echo "--- Step 8: Checking LPAR status ---"
+
+while true; do
+    # Get the current status of the instance [6, 16].
+    LPAR_STATUS=$(ibmcloud pi instance get $LPAR_NAME --json | jq -r '.status')
+    
+    if [[ "$LPAR_STATUS" == "ACTIVE" ]]; then
+        echo "SUCCESS: LPAR $LPAR_NAME is now ACTIVE."
+        echo "Automation workflow complete. Monitor the LPAR console for the OS IPL sequence."
+        break
+    elif [[ "$LPAR_STATUS" == "ERROR" ]]; then
+        echo "Error: LPAR $LPAR_NAME entered ERROR state after boot. Aborting."
+        exit 1 # Triggers cleanup (deletes cloned volumes)
+    else
+        echo "LPAR $LPAR_NAME status: $LPAR_STATUS (Expected: ACTIVE). Waiting 30 seconds..."
+        sleep 30
+    fi
+done
+
+
+# =======================================================================
+# SUCCESS COMPLETION
+# =======================================================================
+
+# Set success flag and exit cleanly
+JOB_SUCCESS=1
+echo "Script successfully completed all deployment steps."
+# The EXIT trap runs, sees JOB_SUCCESS=1, and terminates cleanly.
