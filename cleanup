@@ -326,7 +326,7 @@ if [ $? -ne 0 ]; then
     exit 1 
 fi
 
-echo "LPAR '$LPAR_NAME' start initiated successfully in NORMAL mode (Boot Mode A)."
+echo "LPAR '$LPAR_NAME' start initiated successfully in NORMAL mode."
 
 
 # =============================================================
@@ -346,7 +346,7 @@ while true; do
         echo "Error: LPAR $LPAR_NAME entered ERROR state after boot. Aborting."
         exit 1 # Triggers cleanup (deletes cloned volumes)
     else
-        echo "LPAR $LPAR_NAME status: $LPAR_STATUS (Expected: ACTIVE). Waiting 30 seconds..."
+        echo "LPAR $LPAR_NAME status: $LPAR_STATUS. Waiting 30 seconds..."
         sleep 30
     fi
 done
