@@ -270,7 +270,7 @@ echo "--- Step 6: Attaching cloned volumes to $LPAR_NAME ---"
 # --- Re-target and LPAR Status Check Retry Loop ---
 
 # IMPORTANT: Re-target the workspace to ensure CLI context is sound.
-ibmcloud pi ws target "$PVS_CRN" || { echo "ERROR: Failed to re-target PowerVS workspace 
+ibmcloud pi ws target "$PVS_CRN" || { echo "ERROR: Failed to re-target PowerVS workspace $PVS_CRN."; exit 1; }
 
 # Action: Check LPAR existence and status [6].
 STATUS=$(ibmcloud pi instance get "$LPAR_NAME" --json 2>/dev/null | jq -r '.status')
